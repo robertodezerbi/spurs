@@ -1,8 +1,9 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 cd "$(dirname "$0")"
-if [ ! -d .venv ]; then echo 'Please open ClipForge once before enabling AI.'; read -r -p 'Press Return...'; exit 1; fi
-source .venv/bin/activate
-python -m pip install -r requirements-ai.txt
-echo 'AI installed. Restart ClipForge using Open ClipForge.command.'
-read -r -p 'Press Return to close...'
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+trap 'code=$?; if [ -t 0 ]; then read -r -p "Press Return to close..."; fi; exit "$code"' EXIT
+if [ ! -x .venv/bin/python ]; then echo 'Open ClipForge once to create its Python environment.'; exit 1; fi
+.venv/bin/python -m pip install -r requirements-ai.txt
+.venv/bin/python -m pip check
+echo 'AI packages installed. Models are downloaded separately with explicit consent in the app.'

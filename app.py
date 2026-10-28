@@ -1,23 +1,22 @@
 import json, os, re, shutil, subprocess, threading, uuid
 from pathlib import Path
+from runtime import executable, run, validate_export, diagnostics
+from concurrent.futures import ThreadPoolExecutor
+import math
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 ROOT=Path(__file__).resolve().parent
-DATA=ROOT/'data'; DATA.mkdir(exist_ok=True)
+DATA=Path(os.getenv('CLIPFORGE_DATA_DIR', str(ROOT/'data'))).expanduser().resolve(); DATA.mkdir(parents=True,exist_ok=True)
+WORKERS=ThreadPoolExecutor(max_workers=1,thread_name_prefix='clipforge')
 app=FastAPI(title='ClipForge — Local Video Clipper')
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 JOBS={}
 
-def run(args):
-    p=subprocess.run(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-    if p.returncode: raise RuntimeError(p.stderr[-1800:])
-    return p.stdout
-
 def probe(path):
-    info=json.loads(run(['ffprobe','-v','error','-show_entries','format=duration:stream=codec_type,width,height','-of','json',str(path)]))
+    info=json.loads(run([executable('ffprobe'),'-v','error','-show_entries','format=duration:stream=codec_type,width,height','-of','json',str(path)]))
     return {'duration':float(info['format'].get('duration',0)), 'streams':info.get('streams',[])}
 
 def folder(pid):
@@ -28,7 +27,16 @@ def folder(pid):
 
 def metadata(p): return json.loads((p/'project.json').read_text())
 
-def save_meta(p,m): (p/'project.json').write_text(json.dumps(m,indent=2))
+def save_meta(p,m):
+    temporary=p/('meta-'+uuid.uuid4().hex+'.tmp')
+    temporary.write_text(json.dumps(m,indent=2))
+    temporary.replace(p/'project.json')
+
+@app.get('/api/health')
+def health(): return {'application':'clipforge','status':'ok'}
+
+@app.get('/api/diagnostics')
+def diagnose(): return diagnostics(DATA)
 
 @app.get('/')
 def home(): return FileResponse(ROOT/'static'/'index.html')
@@ -80,13 +88,15 @@ def srt_time(s):
     return f'{h:02}:{mi:02}:{sec:02},{ms:03}'
 
 def render_worker(pid,jobid,req):
-    job=JOBS[jobid];p=folder(pid);m=metadata(p)
+    job=JOBS[jobid];out=None
     try:
+        p=folder(pid);m=metadata(p)
         job.update(status='rendering')
         src=p/m['source'];out=p/(jobid+'.mp4')
         vf=[]
         if req.vertical: vf.append('scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1')
         if req.captions:
+            if not m.get('transcript'): raise ValueError('Captions requested but no transcript is available. Analyze the video first.')
             transcript=m.get('transcript') or []
             lines=[];i=0
             for seg in transcript:
@@ -97,20 +107,25 @@ def render_worker(pid,jobid,req):
                 srt=p/(jobid+'.srt');srt.write_text('\n'.join(lines))
                 # Use relative filename from project cwd, avoiding path escaping issues
                 vf.append(f"subtitles={jobid}.srt:force_style='FontSize=14,Outline=2,Alignment=2,MarginV=140'")
-        cmd=['ffmpeg','-y','-ss',str(req.start),'-i',str(src),'-t',str(req.end-req.start)]
+        cmd=[executable('ffmpeg'),'-y','-ss',str(req.start),'-i',str(src),'-t',str(req.end-req.start)]
         if vf:cmd+=['-vf',','.join(vf)]
-        cmd+=['-c:v','libx264','-preset','veryfast','-crf','21','-pix_fmt','yuv420p','-c:a','aac','-b:a','160k','-movflags','+faststart',str(out)]
+        cmd+=['-threads','2','-filter_threads','1','-c:v','libx264','-preset','veryfast','-crf','21','-pix_fmt','yuv420p','-c:a','aac','-b:a','160k','-movflags','+faststart',str(out)]
         proc=subprocess.run(cmd,cwd=p,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
         if proc.returncode:raise RuntimeError(proc.stderr[-1800:])
+        qa=validate_export(out,req.end-req.start,req.vertical,any(s['codec_type']=='audio' for s in probe(src)['streams']))
+        job.update(quality_checks=qa)
         job.update(status='done',url=f'/api/download/{pid}/{jobid}',filename=out.name)
-    except Exception as e:job.update(status='error',error=str(e))
+    except Exception as e:
+        if out: out.unlink(missing_ok=True)
+        job.update(status='error',error=str(e))
 
 @app.post('/api/projects/{pid}/render')
 def render(pid:str,req:ClipRequest):
     p=folder(pid);m=metadata(p)
+    if not (math.isfinite(req.start) and math.isfinite(req.end)):raise HTTPException(400,'Clip times must be finite')
     if not (0<=req.start<req.end<=m['duration']+.05):raise HTTPException(400,'Invalid clip boundaries')
     jobid=uuid.uuid4().hex;JOBS[jobid]={'status':'queued'}
-    threading.Thread(target=render_worker,args=(pid,jobid,req),daemon=True).start()
+    WORKERS.submit(render_worker,pid,jobid,req)
     return {'job_id':jobid}
 
 @app.get('/api/jobs/{jobid}')
@@ -120,6 +135,7 @@ def job(jobid:str):
 
 @app.get('/api/download/{pid}/{jobid}')
 def download(pid:str,jobid:str):
+    if not re.fullmatch(r'[a-f0-9]{32}',jobid):raise HTTPException(400,'Invalid export ID')
     p=folder(pid);f=p/(jobid+'.mp4')
     if not f.exists():raise HTTPException(404,'Export not found')
     return FileResponse(f,filename='clipforge-'+jobid[:8]+'.mp4',media_type='video/mp4')
@@ -160,5 +176,5 @@ def transcribe_worker(pid,jobid):
 @app.post('/api/projects/{pid}/analyze')
 def analyze(pid:str):
     folder(pid);jid=uuid.uuid4().hex;JOBS[jid]={'status':'queued'}
-    threading.Thread(target=transcribe_worker,args=(pid,jid),daemon=True).start()
+    WORKERS.submit(transcribe_worker,pid,jid)
     return {'job_id':jid}
