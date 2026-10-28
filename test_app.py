@@ -277,3 +277,26 @@ def test_live_launcher_upload_and_export(sample, tmp_path):
     # The launcher must stop its child server too.
     with socket.socket() as sock:
         assert sock.connect_ex(('127.0.0.1', port)) != 0
+
+
+def test_draft_preview_does_not_replace_final_export(client, sample, tmp_path):
+    pid = upload(client, sample)
+    result = wait_job(client, client.post(f'/api/projects/{pid}/render', json={
+        'start': 0, 'end': 1, 'preview': True}).json()['job_id'])
+    assert result['status'] == 'done', result
+    assert result['quality_checks']['width'] == 360
+    assert result['quality_checks']['height'] == 640
+    assert client.get(result['url']).status_code == 200
+    sizes = client.get('/api/storage').json()['bytes']
+    assert sizes['previews'] > 0
+    assert sizes['exports'] == 0
+
+
+def test_export_history_survives_reload(client, sample):
+    pid = upload(client, sample)
+    jid = client.post(f'/api/projects/{pid}/render', json={'start': 0, 'end': 1}).json()['job_id']
+    assert wait_job(client, jid)['status'] == 'done'
+    history = client.get(f'/api/projects/{pid}/jobs').json()
+    assert history[0]['job_id'] == jid
+    assert history[0]['status'] == 'done'
+    assert client.get(history[0]['url']).status_code == 200

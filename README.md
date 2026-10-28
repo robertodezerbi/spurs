@@ -1,61 +1,79 @@
-# ClipForge — Local AI Video Clipper
+# ClipForge — local video studio
 
-A **working local-first MVP** with video upload, browser preview, manual clip selection, FFmpeg export, vertical cropping, and optional local AI transcription with heuristic clip suggestions and subtitle burn-in.
+This update starts from the seven uploaded project files. It restores the missing web interface and improves startup, rendering, diagnostics, persistence, and long-audio processing. Core upload, manual editing, captions, previews, and MP4 exports do not require paid services or model downloads.
 
-## Quick start
+## Open on a Mac
 
-Install Python 3.10+ and **FFmpeg** (including ffprobe), both available on your PATH.
+1. Keep all files together after extracting the project ZIP.
+2. Install **Python 3.10–3.12** and **FFmpeg with FFprobe**. With existing Homebrew: `brew install python@3.12 ffmpeg`. Installing Homebrew itself is a separate system setup action; ClipForge does not install it or request administrator privileges.
+3. Double-click **Open ClipForge.command**. If macOS blocks it, use Finder's right-click → Open only if you trust the files. If execute permissions were lost, run `chmod +x *.command` inside this folder.
+4. Keep the Terminal window open. Control+C stops the server and its child process.
 
-```bash
-cd clipforge
-python -m venv .venv
-source .venv/bin/activate     # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn app:app --host 127.0.0.1 --port 8000
-```
+The launcher handles Apple Silicon `/opt/homebrew/bin` and Intel `/usr/local/bin`, checks Python and FFmpeg, creates an isolated `.venv`, installs core dependencies when requirements change, checks for port conflicts, and waits for an application health response before opening the browser. It binds only to `127.0.0.1`. Set `CLIPFORGE_PORT` to use another port. It does not expose a public website.
 
-Open **http://127.0.0.1:8000**. Upload a video, select start/end seconds, then Export MP4.
+If startup fails, run **Repair ClipForge.command**. It checks Python, package consistency, FFmpeg/FFprobe, disk writing, port availability, and a disposable render. It never removes projects or installs packages. For a saved report: `.venv/bin/python repair.py --output diagnostic-report.json` (will not overwrite an existing file).
 
-### Enable optional AI transcription
+### Manual startup / Linux
 
 ```bash
-pip install -r requirements-ai.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python launcher.py
 ```
 
-Restart the server. Click **Analyze full video**. First use downloads an open-source Whisper model. The default is `base` on CPU; override with `WHISPER_MODEL=small` (or another supported model). Analysis may be slow for long videos. AI clip suggestions are ranked using transparent **speech density and duration heuristics**, not a full LLM semantic analysis. Captions use transcript segments, not word-level animation.
+FFmpeg and FFprobe must be installed by your OS package manager. Set `CLIPFORGE_FFMPEG` and `CLIPFORGE_FFPROBE` to explicit executable paths for custom installations. Use `CLIPFORGE_NO_BROWSER=1` in a headless environment.
 
-## Capabilities
+## Workflow
 
-- No arbitrary video-duration cap, export quota, subscription, or watermark.
-- Uploads streamed in chunks to local disk; long files still require sufficient storage and processing time.
-- Manual timestamps, clip preview, centered 9:16 crop, MP4 H.264/AAC export.
-- Optional transcription, transcript display, automatic clip suggestions, basic subtitle burn-in.
-- Projects saved in `data/` on your computer.
+Upload or drag in a local MP4/MOV/MKV/WebM/AVI/M4V. Set clip boundaries or mark the current playback time. Preview the selection, save clip settings, optionally correct the transcript, and render a draft or final MP4.
 
-## Honest limitations
+- Vertical framing defaults to **preserve full image**. It may add intentional bars, preserving subjects at the edges. Center crop is available and must be checked manually for cut-off faces.
+- Draft previews use 360×640 vertical output; final vertical exports use 1080×1920. Landscape exports retain source size; landscape drafts use width 640.
+- Software H.264/AAC is the tested encoder. Apple VideoToolbox is an explicit option when FFmpeg advertises it. Runtime errors are shown; it is not benchmarked or validated here on macOS.
+- Captions require transcript segments that overlap the clip and FFmpeg's libass/subtitles filter. Whisper word timings produce short groups; manually entered segments use proportional timing if they need multiple caption blocks. Manual corrections are not claimed to have word alignment.
+- Technical validation checks H.264 video, duration, dimensions, frame rate, source-audio retention, stream timing offsets, and complete decoding before allowing downloads. Warnings and limitations are returned with the job. These checks do **not** guarantee perceptual sync, accurate transcription, correct meaning, or editorial excellence.
+- The Football Podcast Professional preset preserves the image, uses restrained captions, and adds no effects. Save custom presets and clip boundaries locally.
 
-- This is **not yet an OpusClip equivalent**. It does not implement speaker tracking, automatic B-roll, word-by-word animated captions, a full timeline editor, sophisticated semantic clip ranking, or YouTube link import.
-- Local use only. No authentication; **do not expose this server to the public internet**.
-- Long files need free disk space and may take hours to transcribe or render. FFmpeg must include libx264 and the subtitles filter for caption burn-in.
-- Cropping is centered, not face-tracked. Browser playback support for source MOV/MKV/AVI depends on browser codecs; export still works.
-- The source-video endpoint does not implement special seeking optimizations beyond standard file serving.
-- Only upload media you have rights or permission to edit.
+## Optional local transcription
 
-## Troubleshooting
+Run **Enable AI.command** (or `.venv/bin/python -m pip install -r requirements-ai.txt`). The constrained native AI stack requires **macOS 13+**; binary-wheel availability was checked for Intel/Python 3.10 and Apple Silicon/Python 3.12. This is not an on-device runtime test. The core app is separate from this optional stack.
 
-- `ffmpeg not found`: install FFmpeg and make sure `ffmpeg` and `ffprobe` work in your terminal.
-- AI analysis unavailable: install `requirements-ai.txt`, then restart the server.
-- Caption export fails: ensure your FFmpeg has the `subtitles` filter (`ffmpeg -filters | grep subtitles`).
+| Mode | Whisper model | Approximate weights | Strategy |
+| --- | --- | --- | --- |
+| Fast | tiny | 75 MB | CPU int8, beam 1 |
+| Balanced | base | 145 MB | CPU int8, beam 3 |
+| Maximum quality | small | 485 MB | CPU int8, beam 5 |
 
-## Run automated smoke test
+The interface shows model sizes and requires download consent for an uncached model. Packages and weights have additional disk costs. Cached models are shared across projects. The model panel allows explicit removal when no analysis is active. This Faster-Whisper backend does **not** support Metal/MPS; Mac architecture is detected without claiming unsupported acceleration.
+
+Audio is extracted one bounded 180-second chunk at a time with three seconds of context on either side. Word midpoints assign overlap ownership; offsets are merged into source time. Actual model outputs can still vary at chunk boundaries and require review. SQLite caches completed chunks and transcripts using the source content, model, engine version, and analysis settings. Retrying interrupted analysis reuses completed chunks. ETA appears only after measured work; measurements include extraction/transcription and are stored with hardware facts.
+
+Suggestions use sentence-end cues, opening-dependency cues, speech density, duration fit, and overlap suppression. They are **heuristics**, not semantic understanding or contextual verification. Useful/not-useful ratings update bounded local feature weights for reranking; they do not train Whisper or a language model.
+
+## Imports and privacy
+
+Public direct-media HTTP(S) URLs are an optional streaming import route. Standard ports only; private network addresses, embedded credentials, and private redirect targets are rejected. Proxy/TLS verification remains enabled. Live remote importing was not validated against an external video host; its streaming and failure paths have automated tests.
+
+YouTube extraction is deliberately unavailable in this build. Import failures preserve the project, report the reason, and allow a local authorized source to be supplied. No DRM, access controls or authentication requirements are bypassed.
+
+Local operation is the only implemented access mode. Cross-origin browser requests and non-local host headers are rejected. **Do not run a public reverse proxy or forward this port.** Private remote and hosted modes still require authentication, encrypted transport, authorization, and security testing before implementation. No paid AI APIs, analytics, authentication provider, or cloud storage are required.
+
+## Storage and recovery
+
+Projects live in `data/` by default. Set `CLIPFORGE_DATA_DIR` **before launching** to select a different writable storage location. Stop the app before moving data; back up the entire folder (including SQLite WAL files if present) and do not overwrite existing projects. This build does not perform automatic migration.
+
+The dashboard separates originals, models, temporary files, previews, exports, and metadata/cache. Set the minimum free-space reserve in the UI (default 256 MiB, minimum 64 MiB). Space is checked during upload, before analysis/render, between chunks and during rendering. Low-space work pauses with an explicit error. An in-flight network upload may also use the OS temporary directory for multipart spooling; keep sufficient space there too.
+
+Originals and completed exports are never silently deleted. Transient audio/render files are removed on completion/failure and after restart. Jobs persist in SQLite; unfinished jobs become **interrupted** on server restart. Retry analysis to resume from cached chunks; interrupted rendering is restarted, not resumed from a partial MP4. Run only one server process per data directory.
+
+## Development and validation
 
 ```bash
-pip install httpx pytest
-pytest -q
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+.venv/bin/python -m pip check
 ```
 
-## One-click Mac launcher
+The regression suite generates real test videos and tests upload → render → technical validation → download, caption burn-in, draft resolution, local HTTP startup/shutdown, storage failure, imports/fallback, persistence, cache reuse, overlap ownership, presets, transcript edits, and feedback weights. Controlled transcription engines test chunk/cache behavior; they do not validate speech accuracy. See `ENGINEERING.md` for phase status and remaining requirements.
 
-After extracting the ZIP, **double-click `Open ClipForge.command`**. It opens the website automatically in your browser, creates a local Python virtual environment and installs the core Python dependencies on first run. You need Python 3.10+ and FFmpeg installed first. On macOS, if the system blocks the launcher, right-click the file and choose **Open** (only if you trust the downloaded code). Keep its Terminal window open while editing. Optional AI transcription requires a separate one-time install with `pip install -r requirements-ai.txt` inside `.venv`.
-
-The website is local at `http://127.0.0.1:8000`, not a publicly hosted URL. The launcher does not deploy anything online.
+Model access in this cloud environment is currently blocked by its network policy. Hugging Face destination additions and reusable installation/start instructions were saved in the environment draft; review/save in environment settings and publish to activate. Draft saving does not apply network changes or prove fresh-task restoration. The uploaded source is committed locally; the GitHub remote initially contained no commits or `main` branch. Nothing was pushed.

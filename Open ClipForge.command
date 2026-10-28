@@ -14,7 +14,7 @@ if [ ! -x .venv/bin/python ]; then "$PY" -m venv .venv; fi
 .venv/bin/python -c 'from runtime import diagnostics; import json,sys; r=diagnostics("."); print(json.dumps(r,indent=2)); sys.exit(not r["ok"])'
 # Reinstall only if this requirements file changed or dependency validation fails.
 STAMP="$(.venv/bin/python -c 'import hashlib; print(hashlib.sha256(open("requirements.txt","rb").read()).hexdigest())')"
-if [ ! -f .venv/clipforge-requirements ] || [ "$(cat .venv/clipforge-requirements)" != "$STAMP" ] || ! .venv/bin/python -m pip check >/dev/null 2>&1; then
+if [ ! -f .venv/clipforge-requirements ] || [ "$(cat .venv/clipforge-requirements)" != "$STAMP" ] || ! .venv/bin/python -m pip check >/dev/null 2>&1 || ! .venv/bin/python -c "import fastapi,uvicorn,multipart" >/dev/null 2>&1; then
   .venv/bin/python -m pip install -r requirements.txt
   .venv/bin/python -m pip check
   echo "$STAMP" > .venv/clipforge-requirements

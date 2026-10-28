@@ -196,6 +196,7 @@ class ClipRequest(BaseModel):
     vertical: bool = True
     framing: Literal['fit', 'center'] = 'fit'
     captions: bool = False
+    preview: bool = False
     caption_font_size: int = Field(default=18, ge=12, le=32)
     caption_color: str = Field(default='&H00FFFFFF', pattern=r'^&H[0-9A-Fa-f]{8}$')
     encoder: Literal['software', 'hardware'] = 'software'
@@ -239,7 +240,7 @@ def update_job(jid, **changes):
 
 
 def render_worker(pid, jid, req):
-    directory = folder(pid); out = directory / (jid + '.mp4')
+    directory = folder(pid); out = directory / (('preview-' if req.preview else '') + jid + '.mp4')
     temporary = directory / 'tmp' / jid; temporary.mkdir(parents=True, exist_ok=True)
     try:
         value = metadata(directory); src = directory / value['source']
@@ -247,12 +248,15 @@ def render_worker(pid, jid, req):
         ensure_space(int((req.end - req.start) * 2_000_000))
         update_job(jid, status='rendering')
         vf = []
+        width, height = (360, 640) if req.preview else (1080, 1920)
         if req.vertical:
             if req.framing == 'center':
-                vf.append('scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1')
+                vf.append(f'scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1')
             else:
                 # Fit preserves every face without making unverified speaker-tracking claims.
-                vf.append('scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1')
+                vf.append(f'scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1')
+        elif req.preview:
+            vf.append('scale=640:-2')
         caption_count = 0
         if req.captions:
             if not diagnostics(DATA).get('subtitles'):
@@ -293,10 +297,10 @@ def render_worker(pid, jid, req):
                 raise RuntimeError(log.read())
         update_job(jid, status='validating')
         qa = validate_export(out, req.end-req.start, req.vertical,
-                             any(s['codec_type'] == 'audio' for s in probe(src)['streams']))
+                             any(s['codec_type'] == 'audio' for s in probe(src)['streams']), dimensions=(width, height))
         qa.update(caption_cues=caption_count, framing=req.framing,
                   limitations='No semantic, face tracking, perceptual sync or editorial guarantee')
-        update_job(jid, status='done', url=f'/api/download/{pid}/{jid}', filename=out.name, quality_checks=qa)
+        update_job(jid, status='done', url=f'/api/download/{pid}/{jid}', filename=out.name, preview=req.preview, quality_checks=qa)
     except Exception as exc:
         out.unlink(missing_ok=True)
         update_job(jid, status='paused' if isinstance(exc, OSError) else 'error', error=str(exc))
@@ -331,8 +335,9 @@ def job(jid: str):
 def download(pid: str, jid: str):
     if not re.fullmatch(r'[a-f0-9]{32}', jid):
         raise HTTPException(400, 'Invalid export ID')
-    directory = folder(pid); path = directory / (jid + '.mp4')
+    directory = folder(pid)
     state = DB.job(jid)
+    path = directory / (('preview-' if state and state.get('preview') else '') + jid + '.mp4')
     if not state or state['status'] != 'done' or not path.exists():
         raise HTTPException(404, 'Validated export not found')
     return FileResponse(path, filename='clipforge-' + jid[:8] + '.mp4', media_type='video/mp4')
@@ -450,6 +455,7 @@ def storage():
         if MODELS in path.parents: category = 'ai_models'
         elif 'tmp' in path.relative_to(DATA).parts: category = 'temporary'
         elif path.name.startswith('source'): category = 'original_media'
+        elif path.name.startswith('preview-'): category = 'previews'
         elif path.suffix == '.mp4': category = 'exports'
         else: category = 'metadata_and_cache'
         totals[category] += path.stat().st_size
@@ -478,7 +484,7 @@ def save_preset(name: str, req: ClipRequest):
     if not 1 <= len(name) <= 80:
         raise HTTPException(400, 'Preset name must contain 1–80 characters')
     with LOCK:
-        value = DB.setting('presets', {}); value[name] = req.model_dump(exclude={'start', 'end', 'title'})
+        value = DB.setting('presets', {}); value[name] = req.model_dump(exclude={'start', 'end', 'title', 'preview'})
         DB.set_setting('presets', value)
     return presets()
 
@@ -533,3 +539,9 @@ def replace_source(pid: str, file: UploadFile = File(...)):
     finally:
         shutil.rmtree(new, ignore_errors=True)
     return imported
+
+
+@app.get('/api/projects/{pid}/jobs')
+def project_jobs(pid: str):
+    folder(pid)
+    return DB.project_jobs(pid)

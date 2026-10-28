@@ -46,6 +46,11 @@ class Store:
             db.execute('UPDATE jobs SET state=?,updated=? WHERE id=?', (json.dumps(value), time.time(), jid))
         return value
 
+    def project_jobs(self, pid):
+        with self.connect() as db:
+            rows = db.execute('SELECT id,kind,state FROM jobs WHERE project=? ORDER BY updated DESC', (pid,)).fetchall()
+        return [{'job_id': jid, 'kind': kind, **json.loads(state)} for jid, kind, state in rows]
+
     def active(self, pid, kind):
         with self.connect() as db:
             rows = db.execute('SELECT id,state FROM jobs WHERE project=? AND kind=?', (pid, kind)).fetchall()

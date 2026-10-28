@@ -31,7 +31,7 @@ def media_info(path):
                            '-show_streams', '-of', 'json', str(path)], timeout=60))
 
 
-def validate_export(path, duration, vertical, expect_audio):
+def validate_export(path, duration, vertical, expect_audio, dimensions=(1080, 1920)):
     info = media_info(path)
     video = next((s for s in info['streams'] if s['codec_type'] == 'video'), None)
     if not video or video.get('codec_name') != 'h264':
@@ -42,8 +42,8 @@ def validate_export(path, duration, vertical, expect_audio):
     numerator, denominator = (int(v) for v in video.get('avg_frame_rate', '0/1').split('/'))
     if denominator == 0 or numerator / denominator <= 0:
         raise RuntimeError('Export validation failed: invalid frame rate')
-    if vertical and (video['width'], video['height']) != (1080, 1920):
-        raise RuntimeError('Export validation failed: expected 1080×1920')
+    if vertical and (video['width'], video['height']) != dimensions:
+        raise RuntimeError(f'Export validation failed: expected {dimensions[0]}×{dimensions[1]}')
     if expect_audio and not any(s['codec_type'] == 'audio' for s in info['streams']):
         raise RuntimeError('Export validation failed: source audio is missing')
     audio = next((s for s in info['streams'] if s['codec_type'] == 'audio'), None)
