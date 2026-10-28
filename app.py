@@ -1,180 +1,480 @@
-import json, os, re, shutil, subprocess, threading, uuid
-from pathlib import Path
-from runtime import executable, run, validate_export, diagnostics
+"""ClipForge's local HTTP API. Heavy work runs in a bounded background queue."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+import hashlib
+import json
+import logging
 import math
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
 
-ROOT=Path(__file__).resolve().parent
-DATA=Path(os.getenv('CLIPFORGE_DATA_DIR', str(ROOT/'data'))).expanduser().resolve(); DATA.mkdir(parents=True,exist_ok=True)
-WORKERS=ThreadPoolExecutor(max_workers=1,thread_name_prefix='clipforge')
-app=FastAPI(title='ClipForge — Local Video Clipper')
-app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
-JOBS={}
+from runtime import executable, run, media_info, validate_export, diagnostics
+from store import Store
+from analysis import MODES, model_inventory, model_path, transcribe, rank_candidates
+
+ROOT = Path(__file__).resolve().parent
+DATA = Path(os.getenv('CLIPFORGE_DATA_DIR', str(ROOT / 'data'))).expanduser().resolve()
+DATA.mkdir(parents=True, exist_ok=True)
+MODELS = DATA / '_models'; MODELS.mkdir(exist_ok=True)
+DB = Store(DATA / 'clipforge.sqlite3')
+WORKERS = ThreadPoolExecutor(max_workers=1, thread_name_prefix='clipforge')
+LOCK = threading.RLock()
+LOG = logging.getLogger('clipforge')
+RESERVE = 256 * 1024 * 1024
+PRESETS = {
+    'Football Podcast Professional': {'vertical': True, 'framing': 'fit', 'captions': True,
+        'caption_font_size': 18, 'caption_color': '&H00FFFFFF', 'encoder': 'software',
+        'description': 'Full image preserved, restrained captions, natural cuts, no transitions or zoom effects.'},
+    'Clean landscape': {'vertical': False, 'framing': 'fit', 'captions': False,
+        'caption_font_size': 18, 'caption_color': '&H00FFFFFF', 'encoder': 'software'}
+}
+
+
+@asynccontextmanager
+async def lifespan(app):
+    DB.interrupt_jobs()
+    # Only ephemeral working files are cleaned. Originals, models and exports survive.
+    for project in DATA.iterdir():
+        if re.fullmatch('[a-f0-9]{32}', project.name) and (project / 'tmp').is_dir():
+            shutil.rmtree(project / 'tmp')
+    yield
+
+
+app = FastAPI(title='ClipForge — Local Video Clipper', lifespan=lifespan)
+app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
+
+
+@app.middleware('http')
+async def local_only(request: Request, call_next):
+    # A local app has no remote login. Reject non-loopback hosts and browser origins
+    # rather than exposing private videos accidentally through --host 0.0.0.0.
+    from fastapi.responses import JSONResponse
+    hosts = {'127.0.0.1', 'localhost', '::1', 'testserver'}
+    if request.url.hostname not in hosts:
+        return JSONResponse({'detail': 'Remote access is disabled. Use the local launcher.'}, status_code=403)
+    origin = request.headers.get('origin')
+    if origin:
+        from urllib.parse import urlsplit
+        parsed = urlsplit(origin)
+        if parsed.scheme not in ('http', 'https') or parsed.netloc != request.url.netloc:
+            return JSONResponse({'detail': 'Cross-origin requests are disabled'}, status_code=403)
+    response = await call_next(request)
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; media-src 'self' blob:; object-src 'none'; frame-ancestors 'none'"
+    return response
+
 
 def probe(path):
-    info=json.loads(run([executable('ffprobe'),'-v','error','-show_entries','format=duration:stream=codec_type,width,height','-of','json',str(path)]))
-    return {'duration':float(info['format'].get('duration',0)), 'streams':info.get('streams',[])}
+    info = media_info(path)
+    duration = float(info['format'].get('duration', 0))
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError('Media duration is missing or invalid')
+    return {'duration': duration, 'streams': info.get('streams', [])}
+
 
 def folder(pid):
-    if not re.fullmatch(r'[a-f0-9]{32}',pid): raise HTTPException(400,'Invalid project ID')
-    p=DATA/pid
-    if not p.is_dir(): raise HTTPException(404,'Project not found')
-    return p
+    if not re.fullmatch(r'[a-f0-9]{32}', pid):
+        raise HTTPException(400, 'Invalid project ID')
+    directory = DATA / pid
+    if not directory.is_dir():
+        raise HTTPException(404, 'Project not found')
+    return directory
 
-def metadata(p): return json.loads((p/'project.json').read_text())
 
-def save_meta(p,m):
-    temporary=p/('meta-'+uuid.uuid4().hex+'.tmp')
-    temporary.write_text(json.dumps(m,indent=2))
-    temporary.replace(p/'project.json')
+def metadata(directory):
+    return json.loads((directory / 'project.json').read_text())
 
-@app.get('/api/health')
-def health(): return {'application':'clipforge','status':'ok'}
 
-@app.get('/api/diagnostics')
-def diagnose(): return diagnostics(DATA)
+def save_meta(directory, value):
+    temporary = directory / ('meta-' + uuid.uuid4().hex + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2))
+    temporary.replace(directory / 'project.json')
+
+
+def patch_meta(directory, **changes):
+    with LOCK:
+        value = metadata(directory); value.update(changes); save_meta(directory, value)
+    return value
+
+
+def ensure_space(required=0):
+    free = shutil.disk_usage(DATA).free
+    reserve = DB.setting('storage_reserve_bytes', RESERVE)
+    if free < required + reserve:
+        raise OSError(f'Low storage: need {required + reserve:,} free bytes including safety reserve; '
+                      f'{free:,} available. Free space or move CLIPFORGE_DATA_DIR, then retry. Originals are preserved.')
+
 
 @app.get('/')
-def home(): return FileResponse(ROOT/'static'/'index.html')
+def home():
+    return FileResponse(ROOT / 'static' / 'index.html')
+
+
+@app.get('/api/health')
+def health():
+    return {'application': 'clipforge', 'status': 'ok'}
+
+
+@app.get('/api/diagnostics')
+def diagnose():
+    result = diagnostics(DATA)
+    result.update(data_directory=str(DATA), models=model_inventory(MODELS),
+                  benchmarks={c['model']: DB.setting('benchmark:' + c['model']) for c in MODES.values()},
+                  remote_access='disabled', active_worker_limit=1)
+    return result
+
 
 @app.post('/api/upload')
-async def upload(file:UploadFile=File(...)):
-    pid=uuid.uuid4().hex; p=DATA/pid;p.mkdir()
-    suffix=Path(file.filename or 'video.mp4').suffix.lower()
-    if suffix not in ('.mp4','.mov','.mkv','.webm','.avi','.m4v'):
-        shutil.rmtree(p);raise HTTPException(400,'Unsupported video format')
-    dest=p/('source'+suffix)
+def upload(file: UploadFile = File(...)):
+    # Sync endpoint: multipart reads, disk writes and FFprobe do not block the event loop.
+    suffix = Path(file.filename or 'video.mp4').suffix.lower()
+    if suffix not in ('.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v'):
+        raise HTTPException(400, 'Unsupported video format')
+    pid = uuid.uuid4().hex; directory = DATA / pid; directory.mkdir()
+    dest = directory / ('source' + suffix)
     try:
-        with dest.open('wb') as f:
-            while chunk:=await file.read(4*1024*1024): f.write(chunk)
-        info=probe(dest)
-        if not any(s.get('codec_type')=='video' for s in info['streams']): raise ValueError('File has no video stream')
-        m={'id':pid,'name':Path(file.filename).name,'source':dest.name,'duration':info['duration'],'transcript':None,'suggestions':[]}
-        save_meta(p,m)
-        return m
-    except Exception as e:
-        shutil.rmtree(p,ignore_errors=True);raise HTTPException(400,str(e))
+        digest = hashlib.sha256()
+        with dest.open('wb') as target:
+            while chunk := file.file.read(4 * 1024 * 1024):
+                ensure_space(len(chunk)); target.write(chunk); digest.update(chunk)
+        info = probe(dest)
+        if not any(s.get('codec_type') == 'video' for s in info['streams']):
+            raise ValueError('File has no video stream')
+        value = {'id': pid, 'name': Path(file.filename or 'video').name, 'source': dest.name,
+                 'duration': info['duration'], 'source_hash': digest.hexdigest(),
+                 'transcript': None, 'suggestions': [], 'edits': {}}
+        save_meta(directory, value)
+        return value
+    except Exception as exc:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        file.file.close()
+
 
 @app.get('/api/projects')
 def projects():
-    out=[]
-    for p in DATA.iterdir():
-        if (p/'project.json').exists():
-            try: out.append(metadata(p))
-            except Exception: pass
-    return out
+    result = []
+    for directory in DATA.iterdir():
+        if (directory / 'project.json').exists():
+            try:
+                result.append(metadata(directory))
+            except (OSError, ValueError):
+                LOG.exception('Cannot load project %s', directory.name)
+    return result
+
 
 @app.get('/api/projects/{pid}')
-def project(pid:str): return metadata(folder(pid))
+def project(pid: str):
+    return metadata(folder(pid))
+
 
 @app.get('/api/projects/{pid}/source')
-def source(pid:str):
-    p=folder(pid);m=metadata(p)
-    return FileResponse(p/m['source'],media_type='video/mp4')
+def source(pid: str):
+    directory = folder(pid)
+    return FileResponse(directory / metadata(directory)['source'])
+
 
 class ClipRequest(BaseModel):
-    start:float
-    end:float
-    vertical:bool=True
-    captions:bool=False
-    title:str='clip'
+    model_config = ConfigDict(allow_inf_nan=False)
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    vertical: bool = True
+    framing: Literal['fit', 'center'] = 'fit'
+    captions: bool = False
+    caption_font_size: int = Field(default=18, ge=12, le=32)
+    caption_color: str = Field(default='&H00FFFFFF', pattern=r'^&H[0-9A-Fa-f]{8}$')
+    encoder: Literal['software', 'hardware'] = 'software'
+    title: str = Field(default='clip', max_length=200)
 
-def srt_time(s):
-    ms=round(s*1000);h,ms=divmod(ms,3600000);mi,ms=divmod(ms,60000);sec,ms=divmod(ms,1000)
-    return f'{h:02}:{mi:02}:{sec:02},{ms:03}'
 
-def render_worker(pid,jobid,req):
-    job=JOBS[jobid];out=None
+def srt_time(seconds):
+    ms = round(seconds * 1000); hours, ms = divmod(ms, 3600000)
+    minutes, ms = divmod(ms, 60000); sec, ms = divmod(ms, 1000)
+    return f'{hours:02}:{minutes:02}:{sec:02},{ms:03}'
+
+
+def captions_for(transcript, start, end):
+    import textwrap
+    lines = []; timings = []
+    for segment in transcript:
+        words = segment.get('words') or []
+        # Word timestamps, when present, allow short readable timed groups.
+        groups = [words[i:i+6] for i in range(0, len(words), 6)] if words else []
+        cues = [{'start': g[0]['start'], 'end': g[-1]['end'], 'text': ''.join(w['word'] for w in g).strip()} for g in groups] if groups else [segment]
+        for cue in cues:
+            a, b = max(start, float(cue['start'])), min(end, float(cue['end']))
+            if b <= a:
+                continue
+            # SRT cannot safely represent embedded ASS/HTML control sequences.
+            text = re.sub(r'<[^>]*>|\{[^}]*\}', '', cue['text']).replace('\\', '').replace('-->', '→')
+            wrapped = textwrap.wrap(text, width=32)
+            # Long segment captions are divided into <=2 lines per cue, proportionally.
+            blocks = ['\n'.join(wrapped[i:i+2]) for i in range(0, len(wrapped), 2)]
+            for index, block in enumerate(blocks):
+                x = a + (b-a)*index/len(blocks) - start
+                y = a + (b-a)*(index+1)/len(blocks) - start
+                lines.extend([str(len(timings)+1), f'{srt_time(x)} --> {srt_time(y)}', block, ''])
+                timings.append((x, y))
+    return '\n'.join(lines), timings
+
+
+def update_job(jid, **changes):
+    DB.update_job(jid, **changes)
+    LOG.info('job=%s state=%s', jid, changes.get('status', 'updated'))
+
+
+def render_worker(pid, jid, req):
+    directory = folder(pid); out = directory / (jid + '.mp4')
+    temporary = directory / 'tmp' / jid; temporary.mkdir(parents=True, exist_ok=True)
     try:
-        p=folder(pid);m=metadata(p)
-        job.update(status='rendering')
-        src=p/m['source'];out=p/(jobid+'.mp4')
-        vf=[]
-        if req.vertical: vf.append('scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1')
+        value = metadata(directory); src = directory / value['source']
+        # Conservative output estimate; monitoring the actual free space continues during encoding.
+        ensure_space(int((req.end - req.start) * 2_000_000))
+        update_job(jid, status='rendering')
+        vf = []
+        if req.vertical:
+            if req.framing == 'center':
+                vf.append('scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1')
+            else:
+                # Fit preserves every face without making unverified speaker-tracking claims.
+                vf.append('scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1')
+        caption_count = 0
         if req.captions:
-            if not m.get('transcript'): raise ValueError('Captions requested but no transcript is available. Analyze the video first.')
-            transcript=m.get('transcript') or []
-            lines=[];i=0
-            for seg in transcript:
-                a=max(req.start,float(seg['start']));b=min(req.end,float(seg['end']))
-                if b<=a:continue
-                i+=1;lines.extend([str(i),f'{srt_time(a-req.start)} --> {srt_time(b-req.start)}',seg['text'].strip(),''])
-            if lines:
-                srt=p/(jobid+'.srt');srt.write_text('\n'.join(lines))
-                # Use relative filename from project cwd, avoiding path escaping issues
-                vf.append(f"subtitles={jobid}.srt:force_style='FontSize=14,Outline=2,Alignment=2,MarginV=140'")
-        cmd=[executable('ffmpeg'),'-y','-ss',str(req.start),'-i',str(src),'-t',str(req.end-req.start)]
-        if vf:cmd+=['-vf',','.join(vf)]
-        cmd+=['-threads','2','-filter_threads','1','-c:v','libx264','-preset','veryfast','-crf','21','-pix_fmt','yuv420p','-c:a','aac','-b:a','160k','-movflags','+faststart',str(out)]
-        proc=subprocess.run(cmd,cwd=p,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
-        if proc.returncode:raise RuntimeError(proc.stderr[-1800:])
-        qa=validate_export(out,req.end-req.start,req.vertical,any(s['codec_type']=='audio' for s in probe(src)['streams']))
-        job.update(quality_checks=qa)
-        job.update(status='done',url=f'/api/download/{pid}/{jobid}',filename=out.name)
-    except Exception as e:
-        if out: out.unlink(missing_ok=True)
-        job.update(status='error',error=str(e))
+            if not diagnostics(DATA).get('subtitles'):
+                raise ValueError('This FFmpeg lacks the subtitles filter. Install a build with libass.')
+            srt, timings = captions_for(value.get('transcript') or [], req.start, req.end)
+            if not timings:
+                raise ValueError('No transcript overlaps this clip. Transcribe or edit its transcript first.')
+            caption_count = len(timings)
+            (temporary / 'captions.srt').write_text(srt, encoding='utf-8')
+            vf.append("subtitles=captions.srt:force_style='FontSize=" + str(req.caption_font_size) +
+                      ',PrimaryColour=' + req.caption_color + ",Outline=2,Alignment=2,MarginV=90'")
+        cmd = [executable('ffmpeg'), '-nostdin', '-v', 'error', '-y', '-ss', str(req.start), '-i', str(src),
+               '-t', str(req.end - req.start), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
+               '-threads', '2', '-filter_threads', '1']
+        if vf:
+            cmd += ['-vf', ','.join(vf)]
+        if req.encoder == 'hardware':
+            from platform import system
+            if system() != 'Darwin' or not diagnostics(DATA).get('videotoolbox_available'):
+                raise ValueError('VideoToolbox is unavailable. Select software encoding.')
+            cmd += ['-c:v', 'h264_videotoolbox', '-b:v', '6M']
+        else:
+            cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21']
+        cmd += ['-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', str(out)]
+        # File-backed stderr avoids a deadlocked pipe and unbounded RAM for long videos.
+        with (temporary / 'render.log').open('w+') as log:
+            proc = subprocess.Popen(cmd, cwd=temporary, stdout=subprocess.DEVNULL, stderr=log)
+            try:
+                while proc.poll() is None:
+                    ensure_space(); time.sleep(.25)
+            except BaseException:
+                proc.terminate()
+                try: proc.wait(timeout=5)
+                except subprocess.TimeoutExpired: proc.kill(); proc.wait()
+                raise
+            if proc.returncode:
+                log.seek(0, 2); length = log.tell(); log.seek(max(0, length-2500))
+                raise RuntimeError(log.read())
+        update_job(jid, status='validating')
+        qa = validate_export(out, req.end-req.start, req.vertical,
+                             any(s['codec_type'] == 'audio' for s in probe(src)['streams']))
+        qa.update(caption_cues=caption_count, framing=req.framing,
+                  limitations='No semantic, face tracking, perceptual sync or editorial guarantee')
+        update_job(jid, status='done', url=f'/api/download/{pid}/{jid}', filename=out.name, quality_checks=qa)
+    except Exception as exc:
+        out.unlink(missing_ok=True)
+        update_job(jid, status='paused' if isinstance(exc, OSError) else 'error', error=str(exc))
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
 
 @app.post('/api/projects/{pid}/render')
-def render(pid:str,req:ClipRequest):
-    p=folder(pid);m=metadata(p)
-    if not (math.isfinite(req.start) and math.isfinite(req.end)):raise HTTPException(400,'Clip times must be finite')
-    if not (0<=req.start<req.end<=m['duration']+.05):raise HTTPException(400,'Invalid clip boundaries')
-    jobid=uuid.uuid4().hex;JOBS[jobid]={'status':'queued'}
-    WORKERS.submit(render_worker,pid,jobid,req)
-    return {'job_id':jobid}
+def render(pid: str, req: ClipRequest):
+    directory = folder(pid); value = metadata(directory)
+    if not req.start < req.end <= value['duration'] + .05:
+        raise HTTPException(400, 'Invalid clip boundaries')
+    jid = uuid.uuid4().hex
+    with LOCK:
+        if DB.active(pid, 'render'):
+            raise HTTPException(409, 'A render is already queued for this project')
+        DB.create_job(jid, pid, 'render', {'status': 'queued'})
+    WORKERS.submit(render_worker, pid, jid, req)
+    return {'job_id': jid}
 
-@app.get('/api/jobs/{jobid}')
-def job(jobid:str):
-    if jobid not in JOBS:raise HTTPException(404,'Job not found')
-    return JOBS[jobid]
 
-@app.get('/api/download/{pid}/{jobid}')
-def download(pid:str,jobid:str):
-    if not re.fullmatch(r'[a-f0-9]{32}',jobid):raise HTTPException(400,'Invalid export ID')
-    p=folder(pid);f=p/(jobid+'.mp4')
-    if not f.exists():raise HTTPException(404,'Export not found')
-    return FileResponse(f,filename='clipforge-'+jobid[:8]+'.mp4',media_type='video/mp4')
+@app.get('/api/jobs/{jid}')
+def job(jid: str):
+    value = DB.job(jid)
+    if value is None:
+        raise HTTPException(404, 'Job not found')
+    return value
 
-def transcribe_worker(pid,jobid):
-    p=folder(pid);m=metadata(p);j=JOBS[jobid]
+
+@app.get('/api/download/{pid}/{jid}')
+def download(pid: str, jid: str):
+    if not re.fullmatch(r'[a-f0-9]{32}', jid):
+        raise HTTPException(400, 'Invalid export ID')
+    directory = folder(pid); path = directory / (jid + '.mp4')
+    state = DB.job(jid)
+    if not state or state['status'] != 'done' or not path.exists():
+        raise HTTPException(404, 'Validated export not found')
+    return FileResponse(path, filename='clipforge-' + jid[:8] + '.mp4', media_type='video/mp4')
+
+
+class AnalyzeRequest(BaseModel):
+    mode: Literal['fast', 'balanced', 'quality'] = 'balanced'
+    allow_download: bool = False
+
+
+def transcribe_worker(pid, jid, req):
+    directory = folder(pid); scratch = directory / 'tmp' / jid
+    scratch.mkdir(parents=True, exist_ok=True)
     try:
-        j.update(status='loading AI model (first run may download weights)')
-        from faster_whisper import WhisperModel
-        model=WhisperModel(os.getenv('WHISPER_MODEL','base'),device='cpu',compute_type='int8')
-        j.update(status='transcribing')
-        segments,_=model.transcribe(str(p/m['source']),vad_filter=True)
-        transcript=[{'start':round(s.start,2),'end':round(s.end,2),'text':s.text.strip()} for s in segments]
-        m['transcript']=transcript
-        # Transparent heuristic suggestions: contiguous speech windows ranked by density and natural boundaries.
-        candidates=[];target=40
-        for i,seg in enumerate(transcript):
-            start=seg['start'];end=start;parts=[]
-            for nxt in transcript[i:]:
-                if nxt['end']-start>65:break
-                end=nxt['end'];parts.append(nxt['text'])
-                dur=end-start
-                if 22<=dur<=55:
-                    words=len(' '.join(parts).split());density=words/max(dur,1)
-                    score=round(50+min(25,density*7)-abs(dur-target)*.35,1)
-                    candidates.append({'start':round(start,2),'end':round(end,2),'score':score,'text':' '.join(parts)[:230]})
-                    if dur>=target:break
-        candidates.sort(key=lambda c:c['score'],reverse=True)
-        selected=[]
-        for c in candidates:
-            if all(min(c['end'],v['end'])-max(c['start'],v['start'])<10 for v in selected):selected.append(c)
-            if len(selected)>=8:break
-        m['suggestions']=selected;save_meta(p,m)
-        j.update(status='done',count=len(transcript))
-    except ImportError:j.update(status='error',error='Install optional AI dependency: pip install -r requirements-ai.txt')
-    except Exception as e:j.update(status='error',error=str(e))
+        value = metadata(directory)
+        if not any(s['codec_type'] == 'audio' for s in probe(directory / value['source'])['streams']):
+            raise ValueError('This source has no audio to transcribe')
+        transcript = transcribe(directory / value['source'], value['duration'], req.mode,
+                                req.allow_download, MODELS, scratch, DB,
+                                lambda **changes: update_job(jid, **changes), ensure_space)
+        update_job(jid, status='analyzing')
+        suggestions = rank_candidates(transcript, DB.preferences())
+        patch_meta(directory, transcript=transcript, suggestions=suggestions, analysis_mode=req.mode)
+        update_job(jid, status='done', count=len(transcript), ranking='heuristic')
+    except ImportError:
+        update_job(jid, status='error', error='Optional AI packages are missing. Run Enable AI.command, then retry.')
+    except Exception as exc:
+        update_job(jid, status='paused' if isinstance(exc, OSError) else 'error', error=str(exc))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
 
 @app.post('/api/projects/{pid}/analyze')
-def analyze(pid:str):
-    folder(pid);jid=uuid.uuid4().hex;JOBS[jid]={'status':'queued'}
-    WORKERS.submit(transcribe_worker,pid,jid)
-    return {'job_id':jid}
+def analyze(pid: str, req: AnalyzeRequest = AnalyzeRequest()):
+    folder(pid); jid = uuid.uuid4().hex
+    with LOCK:
+        existing = DB.active(pid, 'analysis')
+        if existing:
+            return {'job_id': existing}
+        DB.create_job(jid, pid, 'analysis', {'status': 'queued'})
+    WORKERS.submit(transcribe_worker, pid, jid, req)
+    return {'job_id': jid}
+
+
+class Segment(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    text: str = Field(max_length=10000)
+
+
+class TranscriptRequest(BaseModel):
+    segments: list[Segment]
+
+
+@app.put('/api/projects/{pid}/transcript')
+def edit_transcript(pid: str, req: TranscriptRequest):
+    directory = folder(pid); value = metadata(directory)
+    segments = [s.model_dump() for s in req.segments]
+    previous = 0
+    for segment in segments:
+        if not previous <= segment['start'] < segment['end'] <= value['duration']:
+            raise HTTPException(400, 'Transcript must be ordered, non-overlapping and within source duration')
+        previous = segment['end']
+    return patch_meta(directory, transcript=segments, suggestions=rank_candidates(segments, DB.preferences()))
+
+
+@app.put('/api/projects/{pid}/edits')
+def save_edits(pid: str, req: ClipRequest):
+    directory = folder(pid); value = metadata(directory)
+    if not req.start < req.end <= value['duration']:
+        raise HTTPException(400, 'Invalid edit boundaries')
+    return patch_meta(directory, edits=req.model_dump())
+
+
+class FeedbackRequest(BaseModel):
+    candidate_id: str
+    rating: Literal[-1, 1]
+
+
+@app.post('/api/projects/{pid}/feedback')
+def feedback(pid: str, req: FeedbackRequest):
+    directory = folder(pid); value = metadata(directory)
+    candidate = next((c for c in value['suggestions'] if c['id'] == req.candidate_id), None)
+    if not candidate:
+        raise HTTPException(404, 'Candidate not found')
+    DB.feedback(pid, candidate['id'], req.rating, candidate['features'])
+    return patch_meta(directory, suggestions=rank_candidates(value['transcript'], DB.preferences()))
+
+
+@app.get('/api/models')
+def models():
+    return model_inventory(MODELS)
+
+
+@app.delete('/api/models/{name}')
+def delete_model(name: str):
+    if name not in {c['model'] for c in MODES.values()}:
+        raise HTTPException(400, 'Unsupported model')
+    # Do not remove models while an analysis job could be reading/downloading them.
+    with LOCK:
+        if any(DB.active(p['id'], 'analysis') for p in projects()):
+            raise HTTPException(409, 'Wait for analysis to finish before removing a model')
+        shutil.rmtree(model_path(MODELS, name), ignore_errors=True)
+    return {'removed': name}
+
+
+@app.get('/api/storage')
+def storage():
+    totals = {'original_media': 0, 'ai_models': 0, 'temporary': 0, 'previews': 0, 'exports': 0, 'metadata_and_cache': 0}
+    for path in DATA.rglob('*'):
+        if not path.is_file() or path.is_symlink():
+            continue
+        if MODELS in path.parents: category = 'ai_models'
+        elif 'tmp' in path.relative_to(DATA).parts: category = 'temporary'
+        elif path.name.startswith('source'): category = 'original_media'
+        elif path.suffix == '.mp4': category = 'exports'
+        else: category = 'metadata_and_cache'
+        totals[category] += path.stat().st_size
+    return {'bytes': totals, 'free_bytes': shutil.disk_usage(DATA).free,
+            'reserve_bytes': DB.setting('storage_reserve_bytes', RESERVE), 'location': str(DATA),
+            'policy': 'Only transient working files are removed automatically. Originals and exports are preserved.'}
+
+
+class StorageSettings(BaseModel):
+    reserve_bytes: int = Field(ge=64*1024*1024)
+
+
+@app.put('/api/storage/settings')
+def storage_settings(req: StorageSettings):
+    DB.set_setting('storage_reserve_bytes', req.reserve_bytes)
+    return storage()
+
+
+@app.get('/api/presets')
+def presets():
+    return {**PRESETS, **DB.setting('presets', {})}
+
+
+@app.put('/api/presets/{name}')
+def save_preset(name: str, req: ClipRequest):
+    if not 1 <= len(name) <= 80:
+        raise HTTPException(400, 'Preset name must contain 1–80 characters')
+    with LOCK:
+        value = DB.setting('presets', {}); value[name] = req.model_dump(exclude={'start', 'end', 'title'})
+        DB.set_setting('presets', value)
+    return presets()
