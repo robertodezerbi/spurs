@@ -39,14 +39,24 @@ def validate_export(path, duration, vertical, expect_audio):
     actual = float(info['format'].get('duration', 0))
     if abs(actual - duration) > max(.35, duration * .02):
         raise RuntimeError(f'Export duration mismatch: expected {duration:.2f}s, got {actual:.2f}s')
+    numerator, denominator = (int(v) for v in video.get('avg_frame_rate', '0/1').split('/'))
+    if denominator == 0 or numerator / denominator <= 0:
+        raise RuntimeError('Export validation failed: invalid frame rate')
     if vertical and (video['width'], video['height']) != (1080, 1920):
         raise RuntimeError('Export validation failed: expected 1080×1920')
     if expect_audio and not any(s['codec_type'] == 'audio' for s in info['streams']):
         raise RuntimeError('Export validation failed: source audio is missing')
+    audio = next((s for s in info['streams'] if s['codec_type'] == 'audio'), None)
+    warnings = []
+    if audio and abs(float(audio.get('start_time', 0)) - float(video.get('start_time', 0))) > .15:
+        warnings.append('Audio/video stream start offsets differ by more than 150ms. Review synchronization.')
+    if audio and abs(float(audio.get('duration', actual)) - float(video.get('duration', actual))) > .35:
+        warnings.append('Audio/video stream durations differ. Review audio continuity.')
     # Decode every packet: FFprobe metadata alone cannot establish file integrity.
     run([executable('ffmpeg'), '-v', 'error', '-xerror', '-i', str(path),
          '-f', 'null', '-'], timeout=max(120, duration * 4))
     return {'duration': actual, 'width': video['width'], 'height': video['height'],
+            'frame_rate': numerator / denominator, 'warnings': warnings,
             'integrity': 'decoded successfully', 'editorial_review': 'Manual review required'}
 
 

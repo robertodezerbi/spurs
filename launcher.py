@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import subprocess
 import sys
 import time
@@ -11,6 +12,9 @@ import webbrowser
 
 
 def main():
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
     root = Path(__file__).resolve().parent
     os.chdir(root)
     from runtime import diagnostics

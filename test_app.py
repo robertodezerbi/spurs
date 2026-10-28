@@ -185,3 +185,95 @@ def test_rank_and_feedback(tmp_path):
     assert any(v != 0 for v in store.preferences().values())
     reranked = rank_candidates(transcript, store.preferences())
     assert any(c['score'] != next(old['score'] for old in candidates if old['id'] == c['id']) for c in reranked if c['id'] in {v['id'] for v in candidates})
+
+
+def test_optional_import_failure_local_recovery(client, sample, monkeypatch):
+    import imports
+    def unavailable(url): raise ValueError('Simulated import unavailable')
+    monkeypatch.setattr(imports, 'validate_url', unavailable)
+    response = client.post('/api/import', json={'url': 'https://example.com/video.mp4'})
+    assert response.status_code == 200
+    pid = response.json()['id']
+    result = wait_job(client, response.json()['job_id'])
+    assert result['status'] == 'error'
+    assert client.get(f'/api/projects/{pid}').json()['import_error'] == 'Simulated import unavailable'
+    assert client.get(f'/api/projects/{pid}/source').status_code == 409
+    with sample.open('rb') as file:
+        response = client.post(f'/api/projects/{pid}/replace-source', files={'file': ('local.mp4', file, 'video/mp4')})
+    assert response.status_code == 200
+    assert response.json()['id'] == pid
+    assert client.get(f'/api/projects/{pid}/source').status_code == 200
+    result = wait_job(client, client.post(f'/api/projects/{pid}/render', json={'start': 0, 'end': 1}).json()['job_id'])
+    assert result['status'] == 'done', result
+
+
+def test_direct_import_streams_in_blocks(tmp_path, monkeypatch):
+    import imports
+    import io
+    monkeypatch.setattr(imports, 'validate_url', lambda url: None)
+    class Response(io.BytesIO):
+        headers = SimpleNamespace(get_content_type=lambda: 'video/mp4')
+    class Opener:
+        def open(self, request, timeout): return Response(b'v' * (2*1024*1024 + 5))
+    monkeypatch.setattr(imports.urllib.request, 'build_opener', lambda *a: Opener())
+    blocks = []; destination = tmp_path / 'source.mp4'
+    imports.download_media('https://example.com/video', destination, blocks.append)
+    assert blocks == [1024*1024, 1024*1024, 5]
+    assert destination.stat().st_size == sum(blocks)
+
+
+def test_import_url_rejects_private_network(monkeypatch):
+    import imports
+    monkeypatch.setattr(imports.socket, 'getaddrinfo', lambda *a, **kw: [(2, 1, 6, '', ('127.0.0.1', 443))])
+    with pytest.raises(ValueError, match='Private'): imports.validate_url('https://example.com/private')
+    with pytest.raises(ValueError): imports.validate_url('file:///etc/passwd')
+
+
+def test_caption_layout_is_bounded():
+    text, timings = module.captions_for([{'start': 0, 'end': 4, 'text': 'Long caption ' * 25}], 1, 3)
+    assert timings
+    assert all(0 <= a < b <= 2 for a, b in timings)
+    blocks = text.strip().split('\n\n')
+    assert all(len(block.splitlines()[2:]) <= 2 for block in blocks)
+    assert all(len(line) <= 32 for block in blocks for line in block.splitlines()[2:])
+
+
+def test_live_launcher_upload_and_export(sample, tmp_path):
+    """A real loopback server, HTTP upload, captioned render and download."""
+    import httpx
+    import os
+    import socket
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
+    environment = dict(os.environ, CLIPFORGE_NO_BROWSER='1', CLIPFORGE_PORT=str(port),
+                       CLIPFORGE_DATA_DIR=str(tmp_path / 'live-data'))
+    with (tmp_path / 'server.log').open('w+') as log:
+        process = subprocess.Popen([sys.executable, 'launcher.py'], cwd=module.ROOT,
+                                   env=environment, stdout=log, stderr=log)
+        try:
+            with httpx.Client(base_url=f'http://127.0.0.1:{port}', trust_env=False, timeout=5) as live:
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    try:
+                        if live.get('/api/health').status_code == 200: break
+                    except httpx.TransportError: pass
+                    if process.poll() is not None:
+                        log.seek(0); pytest.fail(log.read())
+                    time.sleep(.1)
+                else:
+                    pytest.fail('Live server did not start')
+                assert 'ClipForge' in live.get('/').text
+                pid = upload(live, sample)
+                assert live.put(f'/api/projects/{pid}/transcript', json={'segments': [
+                    {'start': 0, 'end': 2.5, 'text': 'Live server caption test.'}]}).status_code == 200
+                response = live.post(f'/api/projects/{pid}/render', json={'start': 0, 'end': 1.5, 'captions': True})
+                result = wait_job(live, response.json()['job_id'])
+                assert result['status'] == 'done', result
+                download = live.get(result['url'])
+                assert download.status_code == 200 and len(download.content) > 1000
+        finally:
+            process.terminate()
+            process.wait(timeout=15)
+    # The launcher must stop its child server too.
+    with socket.socket() as sock:
+        assert sock.connect_ex(('127.0.0.1', port)) != 0

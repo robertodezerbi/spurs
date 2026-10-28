@@ -184,8 +184,9 @@ def project(pid: str):
 
 @app.get('/api/projects/{pid}/source')
 def source(pid: str):
-    directory = folder(pid)
-    return FileResponse(directory / metadata(directory)['source'])
+    directory = folder(pid); name = metadata(directory)['source']
+    if not name: raise HTTPException(409, 'Import has not completed. Upload a local video instead.')
+    return FileResponse(directory / name)
 
 
 class ClipRequest(BaseModel):
@@ -306,6 +307,7 @@ def render_worker(pid, jid, req):
 @app.post('/api/projects/{pid}/render')
 def render(pid: str, req: ClipRequest):
     directory = folder(pid); value = metadata(directory)
+    if not value['source']: raise HTTPException(409, 'Upload a local source to this project first')
     if not req.start < req.end <= value['duration'] + .05:
         raise HTTPException(400, 'Invalid clip boundaries')
     jid = uuid.uuid4().hex
@@ -401,6 +403,7 @@ def edit_transcript(pid: str, req: TranscriptRequest):
 @app.put('/api/projects/{pid}/edits')
 def save_edits(pid: str, req: ClipRequest):
     directory = folder(pid); value = metadata(directory)
+    if not value['source']: raise HTTPException(409, 'Upload a local source to this project first')
     if not req.start < req.end <= value['duration']:
         raise HTTPException(400, 'Invalid edit boundaries')
     return patch_meta(directory, edits=req.model_dump())
@@ -478,3 +481,55 @@ def save_preset(name: str, req: ClipRequest):
         value = DB.setting('presets', {}); value[name] = req.model_dump(exclude={'start', 'end', 'title'})
         DB.set_setting('presets', value)
     return presets()
+
+
+class ImportRequest(BaseModel):
+    url: str = Field(max_length=4096)
+
+
+def import_worker(pid, jid, url):
+    from imports import download_media, validate_url
+    directory = folder(pid); destination = directory / 'source.mp4'
+    try:
+        update_job(jid, status='importing')
+        parsed = validate_url(url)
+        if parsed.hostname.lower() in ('youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be'):
+            raise ValueError('YouTube extraction is not installed. Use an authorized downloaded copy and upload it locally. No access controls are bypassed.')
+        download_media(url, destination, ensure_space)
+        info = probe(destination)
+        if not any(s['codec_type'] == 'video' for s in info['streams']):
+            raise ValueError('Downloaded file has no video stream')
+        from analysis import fingerprint
+        patch_meta(directory, source=destination.name, duration=info['duration'], source_hash=fingerprint(destination), import_error=None)
+        update_job(jid, status='done')
+    except Exception as exc:
+        destination.unlink(missing_ok=True)
+        patch_meta(directory, import_error=str(exc))
+        update_job(jid, status='error', error=str(exc), alternative='Upload an authorized local video. This project has been preserved.')
+
+
+@app.post('/api/import')
+def import_url(req: ImportRequest):
+    pid = uuid.uuid4().hex; jid = uuid.uuid4().hex
+    directory = DATA / pid; directory.mkdir()
+    save_meta(directory, {'id': pid, 'name': 'URL import', 'source': None, 'duration': 0,
+                          'transcript': None, 'suggestions': [], 'edits': {}})
+    DB.create_job(jid, pid, 'import', {'status': 'queued'})
+    WORKERS.submit(import_worker, pid, jid, req.url)
+    return {'id': pid, 'job_id': jid}
+
+
+@app.post('/api/projects/{pid}/replace-source')
+def replace_source(pid: str, file: UploadFile = File(...)):
+    directory = folder(pid)
+    if metadata(directory)['source'] is not None:
+        raise HTTPException(409, 'A source already exists. Upload as a new project to preserve it.')
+    imported = upload(file)
+    new = DATA / imported['id']
+    try:
+        shutil.move(str(new / imported['source']), str(directory / imported['source']))
+        imported['id'] = pid
+        save_meta(directory, imported)
+    finally:
+        shutil.rmtree(new, ignore_errors=True)
+    return imported

@@ -62,7 +62,8 @@ def rank_candidates(transcript, preferences=None):
     weights = preferences or {}
     for index, segment in enumerate(transcript):
         start = segment['start']; parts = []
-        for nxt in transcript[index:]:
+        for next_index in range(index, len(transcript)):
+            nxt = transcript[next_index]
             duration = nxt['end'] - start
             if duration > 75:
                 break
@@ -109,13 +110,20 @@ def model_inventory(root):
         # Faster-whisper's local_files_only validates the actual snapshot on load.
         installed = directory.is_dir() and any(directory.glob('snapshots/*/model.bin'))
         size = sum(p.stat().st_size for p in directory.rglob('*') if p.is_file() and not p.is_symlink()) if directory.exists() else 0
+        ram = hardware(root)['ram_bytes']
+        required_ram = {'tiny': 1024**3, 'base': 2*1024**3, 'small': 4*1024**3}[config['model']]
         result.append(dict(config, mode=mode, cached=installed, bytes=size,
+                           compatible=ram is None or ram >= required_ram, minimum_ram_bytes=required_ram,
                            backend='faster-whisper / CPU int8', metal=False))
     return result
 
 
 def transcribe(path, duration, mode, allow_download, model_root, scratch, store, update, ensure_space, engine_factory=None):
     config = MODES[mode]
+    info = hardware(model_root)
+    required_ram = {'tiny': 1024**3, 'base': 2*1024**3, 'small': 4*1024**3}[config['model']]
+    if info['ram_bytes'] is not None and info['ram_bytes'] < required_ram:
+        raise ValueError('Insufficient RAM for this mode. Select Fast or Balanced instead.')
     digest = fingerprint(path)
     version = importlib.metadata.version('faster-whisper') if engine_factory is None else 'test'
     identity = f'whisper-v2:{version}:{digest}:{config["model"]}:{config["beam_size"]}:{CHUNK_SECONDS}'
@@ -123,7 +131,10 @@ def transcribe(path, duration, mode, allow_download, model_root, scratch, store,
     if cached is not None:
         update(status='analyzing', progress='Reusing cached transcript')
         return cached
-    ensure_space(config['approx_mb'] * 1024 * 1024 + 64 * 1024 * 1024)
+    inventory = next(m for m in model_inventory(model_root) if m['mode'] == mode)
+    if not inventory['cached'] and not allow_download and engine_factory is None:
+        raise ValueError(f"{config['model']} is not cached. Enable model-download consent or choose a cached model.")
+    ensure_space((0 if inventory['cached'] else config['approx_mb'] * 1024 * 1024) + 64 * 1024 * 1024)
     update(status='loading model', progress=f'{config["model"]}: approximately {config["approx_mb"]} MB if not cached')
     if engine_factory is None:
         from faster_whisper import WhisperModel
