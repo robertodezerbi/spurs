@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import re
 import time
-from runtime import executable, run, hardware
+from runtime import executable, run, hardware, regular_files
 
 MODES = {'fast': {'model': 'tiny', 'approx_mb': 75, 'beam_size': 1},
          'balanced': {'model': 'base', 'approx_mb': 145, 'beam_size': 3},
@@ -109,24 +109,29 @@ def model_inventory(root):
         directory = model_path(root, config['model'])
         # Faster-whisper's local_files_only validates the actual snapshot on load.
         installed = directory.is_dir() and any(directory.glob('snapshots/*/model.bin'))
-        size = sum(p.stat().st_size for p in directory.rglob('*') if p.is_file() and not p.is_symlink()) if directory.exists() else 0
+        size = sum(info.st_size for _,info in regular_files(directory)) if directory.exists() else 0
         ram = hardware(root)['ram_bytes']
         required_ram = {'tiny': 1024**3, 'base': 2*1024**3, 'small': 4*1024**3}[config['model']]
         result.append(dict(config, mode=mode, cached=installed, bytes=size,
                            compatible=ram is None or ram >= required_ram, minimum_ram_bytes=required_ram,
-                           backend='faster-whisper / CPU int8', metal=False))
+                           backend='faster-whisper / CPU (int8 preferred; float32 fallback)', metal=False))
     return result
 
 
 def transcribe(path, duration, mode, allow_download, model_root, scratch, store, update, ensure_space, engine_factory=None):
     config = MODES[mode]
+    compute_type='int8'
+    if engine_factory is None:
+        import ctranslate2
+        supported=ctranslate2.get_supported_compute_types('cpu')
+        if 'int8' not in supported:compute_type='float32'
     info = hardware(model_root)
     required_ram = {'tiny': 1024**3, 'base': 2*1024**3, 'small': 4*1024**3}[config['model']]
     if info['ram_bytes'] is not None and info['ram_bytes'] < required_ram:
         raise ValueError('Insufficient RAM for this mode. Select Fast or Balanced instead.')
     digest = fingerprint(path)
     version = importlib.metadata.version('faster-whisper') if engine_factory is None else 'test'
-    identity = f'whisper-v2:{version}:{digest}:{config["model"]}:{config["beam_size"]}:{CHUNK_SECONDS}'
+    identity = f'whisper-v2:{version}:{digest}:{config["model"]}:{config["beam_size"]}:{compute_type}:{CHUNK_SECONDS}'
     cached = store.cache_get(identity)
     if cached is not None:
         update(status='analyzing', progress='Reusing cached transcript')
@@ -135,11 +140,11 @@ def transcribe(path, duration, mode, allow_download, model_root, scratch, store,
     if not inventory['cached'] and not allow_download and engine_factory is None:
         raise ValueError(f"{config['model']} is not cached. Enable model-download consent or choose a cached model.")
     ensure_space((0 if inventory['cached'] else config['approx_mb'] * 1024 * 1024) + 64 * 1024 * 1024)
-    update(status='loading model', progress=f'{config["model"]}: approximately {config["approx_mb"]} MB if not cached')
+    update(status='loading model', progress=f'{config["model"]}: approximately {config["approx_mb"]} MB if not cached; CPU {compute_type}')
     if engine_factory is None:
         from faster_whisper import WhisperModel
         engine_factory = WhisperModel
-    engine = engine_factory(config['model'], device='cpu', compute_type='int8',
+    engine = engine_factory(config['model'], device='cpu', compute_type=compute_type,
                             download_root=str(model_root), local_files_only=not allow_download,
                             cpu_threads=max(1, min(4, (os.cpu_count() or 2) - 1)))
     transcript = []

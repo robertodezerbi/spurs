@@ -48,7 +48,7 @@ class Store:
 
     def project_jobs(self, pid):
         with self.connect() as db:
-            rows = db.execute('SELECT id,kind,state FROM jobs WHERE project=? ORDER BY updated DESC', (pid,)).fetchall()
+            rows = db.execute('SELECT id,kind,state FROM jobs WHERE project=? AND kind!=? ORDER BY updated DESC', (pid, 'timeline_part')).fetchall()
         return [{'job_id': jid, 'kind': kind, **json.loads(state)} for jid, kind, state in rows]
 
     def active(self, pid, kind):

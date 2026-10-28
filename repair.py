@@ -19,6 +19,21 @@ def report(directory, port=8000):
                         'supported': (3, 10) <= sys.version_info[:2] < (3, 13)}
     check = subprocess.run([sys.executable, '-m', 'pip', 'check'], capture_output=True, text=True)
     result['packages'] = {'ok': check.returncode == 0, 'details': check.stdout + check.stderr}
+    from bootstrap import expected_packages
+    mismatches=[]
+    for package,wanted in expected_packages(Path(__file__).resolve().parent/'requirements.txt').items():
+        try: actual=importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:actual='not installed'
+        if actual!=wanted:mismatches.append({'package':package,'expected':wanted,'actual':actual})
+    result['packages']['version_mismatches']=mismatches
+    if mismatches:result['packages']['ok']=False
+    try:
+        import cv2,numpy
+        from vision import FaceDetector
+        FaceDetector()
+        result['vision']={'opencv':cv2.__version__,'numpy':numpy.__version__,'bundled_detector':'loaded'}
+    except Exception as exc:
+        result['vision']={'error':str(exc)};result['ok']=False
     for package in ('fastapi', 'uvicorn', 'python-multipart', 'faster-whisper'):
         try: result.setdefault('versions', {})[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError: result.setdefault('versions', {})[package] = 'not installed'

@@ -26,3 +26,7 @@ jobs:
       - run: python -c 'from faster_whisper import WhisperModel'
       - run: python -m pytest -q
       - run: python repair.py
+
+      - name: Long synthetic media regression
+        if: runner.os == 'Linux'
+        run: python tools/stress_long.py

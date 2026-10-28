@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import subprocess
 
 
@@ -90,3 +91,17 @@ def diagnostics(path):
         report['videotoolbox_available'] = 'h264_videotoolbox' in encoders
         report['ok'] = report['libx264']
     return report
+
+
+
+def regular_files(root):
+    """A best-effort inventory tolerating concurrent SQLite/model/temp cleanup."""
+    seen=set()
+    for path in Path(root).rglob('*'):
+        try: information=path.lstat()
+        except (FileNotFoundError,NotADirectoryError):continue
+        if not stat.S_ISREG(information.st_mode):continue
+        identity=(information.st_dev,information.st_ino)
+        if identity in seen:continue
+        seen.add(identity)
+        yield path,information

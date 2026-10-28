@@ -14,7 +14,7 @@ if [ -z "$PY" ] || { ! command -v ffmpeg >/dev/null 2>&1 && [ -z "${CLIPFORGE_FF
     case "$answer" in
       y|Y|yes|YES)
         if [ -z "$PY" ]; then brew install python@3.12; PY=python3.12; fi
-        if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then brew install ffmpeg; fi
+        if { ! command -v ffmpeg >/dev/null 2>&1 && [ -z "${CLIPFORGE_FFMPEG:-}" ]; } || { ! command -v ffprobe >/dev/null 2>&1 && [ -z "${CLIPFORGE_FFPROBE:-}" ]; }; then brew install ffmpeg; fi
         ;;
       *) echo 'No system packages changed. Install Python 3.10–3.12 and FFmpeg, then reopen ClipForge.'; exit 1;;
     esac

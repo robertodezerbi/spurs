@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal
 
-from runtime import executable, run, media_info, validate_export, diagnostics
+from runtime import executable, run, media_info, validate_export, diagnostics, regular_files
 from store import Store
 from analysis import MODES, model_inventory, model_path, transcribe, rank_candidates
 
@@ -194,11 +194,18 @@ class ClipRequest(BaseModel):
     start: float = Field(ge=0)
     end: float = Field(gt=0)
     vertical: bool = True
-    framing: Literal['fit', 'center'] = 'fit'
+    framing: Literal['fit', 'center', 'smart'] = 'fit'
     captions: bool = False
     preview: bool = False
     caption_font_size: int = Field(default=18, ge=12, le=32)
     caption_color: str = Field(default='&H00FFFFFF', pattern=r'^&H[0-9A-Fa-f]{8}$')
+    caption_font: Literal['Arial','Helvetica','DejaVu Sans'] = 'Arial'
+    caption_highlight: str = Field(default='&H0000D7FF', pattern=r'^&H[0-9A-Fa-f]{8}$')
+    caption_animation: Literal['none','fade','karaoke'] = 'none'
+    caption_position: Literal['bottom','center','top'] = 'bottom'
+    normalize_audio: bool = False
+    denoise_audio: bool = False
+    fade_audio: bool = False
     encoder: Literal['software', 'hardware'] = 'software'
     title: str = Field(default='clip', max_length=200)
 
@@ -249,8 +256,24 @@ def render_worker(pid, jid, req):
         update_job(jid, status='rendering')
         vf = []
         width, height = (360, 640) if req.preview else (1080, 1920)
+        vision_report = None
+        if req.vertical and req.framing == 'smart':
+            try:
+                from vision import analyze_video, tracking_filter
+            except ImportError as exc:
+                raise ValueError('Vision dependencies are missing. Install requirements-vision.txt, then retry.') from exc
+            key = f'vision-mouth-v1:{value.get("source_hash")}:{req.start}:{req.end}'
+            vision_report = DB.cache_get(key)
+            if vision_report is None:
+                update_job(jid, status='tracking faces')
+                vision_report = analyze_video(src, req.start, req.end, lambda **kw: update_job(jid, **kw))
+                DB.cache_put(key, vision_report)
+            tracking = tracking_filter(vision_report, temporary, width, height)
+            if tracking: vf.append(tracking)
         if req.vertical:
-            if req.framing == 'center':
+            if req.framing == 'smart' and vf:
+                pass
+            elif req.framing == 'center':
                 vf.append(f'scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1')
             else:
                 # Fit preserves every face without making unverified speaker-tracking claims.
@@ -261,18 +284,28 @@ def render_worker(pid, jid, req):
         if req.captions:
             if not diagnostics(DATA).get('subtitles'):
                 raise ValueError('This FFmpeg lacks the subtitles filter. Install a build with libass.')
-            srt, timings = captions_for(value.get('transcript') or [], req.start, req.end)
-            if not timings:
-                raise ValueError('No transcript overlaps this clip. Transcribe or edit its transcript first.')
-            caption_count = len(timings)
-            (temporary / 'captions.srt').write_text(srt, encoding='utf-8')
-            vf.append("subtitles=captions.srt:force_style='FontSize=" + str(req.caption_font_size) +
-                      ',PrimaryColour=' + req.caption_color + ",Outline=2,Alignment=2,MarginV=90'")
+            from captions import ass_captions
+            source_video=next(s for s in probe(src)['streams'] if s['codec_type']=='video')
+            canvas=(1080,1920) if req.vertical else (1080,round(1080*source_video['height']/source_video['width']))
+            script, caption_count, caption_timing = ass_captions(value.get('transcript') or [], req.start, req.end,
+                font=req.caption_font,size=req.caption_font_size,color=req.caption_color,
+                highlight=req.caption_highlight,animation=req.caption_animation,position=req.caption_position,
+                canvas=canvas)
+            (temporary / 'captions.ass').write_text(script,encoding='utf-8')
+            vf.append('subtitles=captions.ass')
+        has_audio=any(s['codec_type']=='audio' for s in probe(src)['streams'])
+        audio_report={'source_audio':has_audio}
+        af=[]
+        if has_audio:
+            from audio import audio_filters
+            update_job(jid,status='preparing audio')
+            af,audio_report=audio_filters(src,req.start,req.end,req.normalize_audio,req.denoise_audio,req.fade_audio)
         cmd = [executable('ffmpeg'), '-nostdin', '-v', 'error', '-y', '-ss', str(req.start), '-i', str(src),
                '-t', str(req.end - req.start), '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn',
                '-threads', '2', '-filter_threads', '1']
         if vf:
             cmd += ['-vf', ','.join(vf)]
+        if af: cmd += ['-af', ','.join(af)]
         if req.encoder == 'hardware':
             from platform import system
             if system() != 'Darwin' or not diagnostics(DATA).get('videotoolbox_available'):
@@ -280,7 +313,7 @@ def render_worker(pid, jid, req):
             cmd += ['-c:v', 'h264_videotoolbox', '-b:v', '6M']
         else:
             cmd += ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21']
-        cmd += ['-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', str(out)]
+        cmd += ['-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar','48000','-ac','2','-b:a', '160k', '-movflags', '+faststart', str(out)]
         # File-backed stderr avoids a deadlocked pipe and unbounded RAM for long videos.
         with (temporary / 'render.log').open('w+') as log:
             proc = subprocess.Popen(cmd, cwd=temporary, stdout=subprocess.DEVNULL, stderr=log)
@@ -298,8 +331,10 @@ def render_worker(pid, jid, req):
         update_job(jid, status='validating')
         qa = validate_export(out, req.end-req.start, req.vertical,
                              any(s['codec_type'] == 'audio' for s in probe(src)['streams']), dimensions=(width, height))
-        qa.update(caption_cues=caption_count, framing=req.framing,
-                  limitations='No semantic, face tracking, perceptual sync or editorial guarantee')
+        qa.update(caption_cues=caption_count, framing=req.framing, audio_processing=audio_report,
+                  caption_timing=caption_timing if req.captions else None, caption_animation=req.caption_animation,
+                  tracking={k:v for k,v in vision_report.items() if k!='points'} if vision_report else None,
+                  limitations='No perceptual sync, speaker-identity or editorial guarantee; review smart tracking manually')
         update_job(jid, status='done', url=f'/api/download/{pid}/{jid}', filename=out.name, preview=req.preview, quality_checks=qa)
     except Exception as exc:
         out.unlink(missing_ok=True)
@@ -359,9 +394,8 @@ def transcribe_worker(pid, jid, req):
                                 req.allow_download, MODELS, scratch, DB,
                                 lambda **changes: update_job(jid, **changes), ensure_space)
         update_job(jid, status='analyzing')
-        suggestions = rank_candidates(transcript, DB.preferences())
-        patch_meta(directory, transcript=transcript, suggestions=suggestions, analysis_mode=req.mode)
-        update_job(jid, status='done', count=len(transcript), ranking='heuristic')
+        patch_meta(directory, transcript=transcript, suggestions=[], analysis_mode=req.mode, semantic_summary=None, ranking=None)
+        update_job(jid, status='done', count=len(transcript), next_step='Run semantic review with an installed local model, or explicitly choose heuristic discovery')
     except ImportError:
         update_job(jid, status='error', error='Optional AI packages are missing. Run Enable AI.command, then retry.')
     except Exception as exc:
@@ -395,6 +429,7 @@ class TranscriptRequest(BaseModel):
 
 @app.put('/api/projects/{pid}/transcript')
 def edit_transcript(pid: str, req: TranscriptRequest):
+    if DB.active(pid,'analysis') or DB.active(pid,'semantic'):raise HTTPException(409,'Wait for transcript/semantic analysis to finish before editing the transcript')
     directory = folder(pid); value = metadata(directory)
     segments = [s.model_dump() for s in req.segments]
     previous = 0
@@ -402,7 +437,7 @@ def edit_transcript(pid: str, req: TranscriptRequest):
         if not previous <= segment['start'] < segment['end'] <= value['duration']:
             raise HTTPException(400, 'Transcript must be ordered, non-overlapping and within source duration')
         previous = segment['end']
-    return patch_meta(directory, transcript=segments, suggestions=rank_candidates(segments, DB.preferences()))
+    return patch_meta(directory, transcript=segments, suggestions=[], semantic_summary=None, ranking=None)
 
 
 @app.put('/api/projects/{pid}/edits')
@@ -426,6 +461,11 @@ def feedback(pid: str, req: FeedbackRequest):
     if not candidate:
         raise HTTPException(404, 'Candidate not found')
     DB.feedback(pid, candidate['id'], req.rating, candidate['features'])
+    if candidate.get('ranking') == 'semantic-local':
+        weights = DB.preferences()
+        for item in value['suggestions']:
+            item['score'] = round(sum(v*(1/3+weights.get(k,0)) for k,v in item['features'].items()),3)
+        return patch_meta(directory, suggestions=sorted(value['suggestions'],key=lambda c:c['score'],reverse=True))
     return patch_meta(directory, suggestions=rank_candidates(value['transcript'], DB.preferences()))
 
 
@@ -449,16 +489,15 @@ def delete_model(name: str):
 @app.get('/api/storage')
 def storage():
     totals = {'original_media': 0, 'ai_models': 0, 'temporary': 0, 'previews': 0, 'exports': 0, 'metadata_and_cache': 0}
-    for path in DATA.rglob('*'):
-        if not path.is_file() or path.is_symlink():
-            continue
+    for path,information in regular_files(DATA):
         if MODELS in path.parents: category = 'ai_models'
         elif 'tmp' in path.relative_to(DATA).parts: category = 'temporary'
+        elif 'previews' in path.relative_to(DATA).parts: category = 'previews'
         elif path.name.startswith('source'): category = 'original_media'
         elif path.name.startswith('preview-'): category = 'previews'
         elif path.suffix == '.mp4': category = 'exports'
         else: category = 'metadata_and_cache'
-        totals[category] += path.stat().st_size
+        totals[category] += information.st_size
     return {'bytes': totals, 'free_bytes': shutil.disk_usage(DATA).free,
             'reserve_bytes': DB.setting('storage_reserve_bytes', RESERVE), 'location': str(DATA),
             'policy': 'Only transient working files are removed automatically. Originals and exports are preserved.'}
@@ -545,3 +584,192 @@ def replace_source(pid: str, file: UploadFile = File(...)):
 def project_jobs(pid: str):
     folder(pid)
     return DB.project_jobs(pid)
+
+
+class SemanticRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=120)
+
+
+@app.get('/api/semantic/models')
+def semantic_models():
+    from semantic import installed_models
+    try: return {'available': True, 'models': installed_models()}
+    except RuntimeError as exc: return {'available': False, 'models': [], 'reason': str(exc)}
+
+
+def semantic_worker(pid, jid, model):
+    from semantic import semantic_rank
+    try:
+        directory = folder(pid); value = metadata(directory)
+        result = semantic_rank(value.get('transcript') or [], model, DB,
+                               lambda **kw: update_job(jid, **kw), DB.preferences())
+        patch_meta(directory, suggestions=result['suggestions'], semantic_summary=result['summary'], ranking='semantic-local')
+        update_job(jid, status='done', count=len(result['suggestions']), model=model)
+    except Exception as exc: update_job(jid, status='error', error=str(exc))
+
+
+@app.post('/api/projects/{pid}/semantic')
+def semantic_analysis(pid: str, req: SemanticRequest):
+    from semantic import installed_models,verify_local_model
+    value = metadata(folder(pid))
+    if not value.get('transcript'): raise HTTPException(409, 'A transcript is required first')
+    try:
+        if req.model not in {m['name'] for m in installed_models()}:
+            raise HTTPException(400, 'Select an installed local model. No model is downloaded automatically.')
+        verify_local_model(req.model)
+    except ValueError as exc:raise HTTPException(400,str(exc)) from exc
+    except RuntimeError as exc: raise HTTPException(503, str(exc)) from exc
+    jid = uuid.uuid4().hex
+    with LOCK:
+        if DB.active(pid, 'semantic'): raise HTTPException(409, 'Semantic analysis is already running')
+        DB.create_job(jid, pid, 'semantic', {'status': 'queued'})
+    WORKERS.submit(semantic_worker, pid, jid, req.model)
+    return {'job_id': jid}
+
+
+class TimelineClip(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    id: str = Field(min_length=1, max_length=80, pattern=r'^[A-Za-z0-9_-]+$')
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    label: str = Field(default='Clip', max_length=120)
+
+
+class TimelineRequest(BaseModel):
+    clips: list[TimelineClip] = Field(max_length=200)
+
+
+def validate_timeline(pid, clips):
+    value=metadata(folder(pid)); ids=set()
+    for clip in clips:
+        if clip.id in ids or not clip.start < clip.end <= value['duration']:
+            raise HTTPException(400,'Timeline clips require unique IDs and valid source boundaries')
+        ids.add(clip.id)
+    return value
+
+
+@app.put('/api/projects/{pid}/timeline')
+def save_timeline(pid: str, req: TimelineRequest):
+    validate_timeline(pid,req.clips)
+    return patch_meta(folder(pid),timeline={'version':1,'clips':[c.model_dump() for c in req.clips]})
+
+
+class TimelineRenderRequest(ClipRequest):
+    clips: list[TimelineClip] = Field(min_length=1,max_length=200)
+
+
+def timeline_render_worker(pid,jid,req):
+    directory=folder(pid); temporary=directory/'tmp'/jid; temporary.mkdir(parents=True,exist_ok=True)
+    parts=[]; out=directory/(('preview-' if req.preview else '')+jid+'.mp4')
+    try:
+        duration=sum(c.end-c.start for c in req.clips)
+        ensure_space(int(duration*2_000_000))
+        for index,clip in enumerate(req.clips):
+            update_job(jid,status='rendering timeline',progress=f'Clip {index+1}/{len(req.clips)}')
+            child=uuid.uuid4().hex
+            DB.create_job(child,pid,'timeline_part',{'status':'queued'})
+            request=ClipRequest(**{**req.model_dump(exclude={'clips'}),'start':clip.start,'end':clip.end})
+            render_worker(pid,child,request)
+            state=DB.job(child)
+            if state['status']!='done':
+                if state['status']=='paused': raise OSError(state.get('error','Timeline render paused'))
+                raise RuntimeError(state.get('error','Timeline clip failed'))
+            part=directory/state['filename']; parts.append(part)
+            os.link(part,temporary/f'part-{index}.mp4')
+        (temporary/'concat.txt').write_text('\n'.join(f"file 'part-{i}.mp4'" for i in range(len(parts))))
+        update_job(jid,status='assembling timeline')
+        has_audio=any(s['codec_type']=='audio' for s in probe(directory/metadata(directory)['source'])['streams'])
+        cmd=[executable('ffmpeg'),'-nostdin','-v','error','-y','-f','concat','-safe','0','-i','concat.txt',
+             '-threads','2','-filter_threads','1','-c:v','libx264','-preset','veryfast','-crf','21','-pix_fmt','yuv420p']
+        if has_audio: cmd+=['-af','aresample=async=1:first_pts=0','-c:a','aac','-ar','48000','-ac','2']
+        cmd+=['-movflags','+faststart',str(out)]
+        with (temporary/'concat.log').open('w+') as log:
+            process=subprocess.Popen(cmd,cwd=temporary,stderr=log,stdout=subprocess.DEVNULL)
+            try:
+                while process.poll() is None: ensure_space(); time.sleep(.2)
+            except BaseException:
+                process.terminate()
+                try: process.wait(timeout=5)
+                except subprocess.TimeoutExpired: process.kill(); process.wait()
+                raise
+            if process.returncode:
+                log.seek(0,2); length=log.tell();log.seek(max(0,length-2000));raise RuntimeError(log.read())
+        qa=validate_export(out,duration,req.vertical,has_audio,dimensions=(360,640) if req.preview else (1080,1920))
+        qa.update(timeline_clips=len(parts),source_ranges=[{'start':c.start,'end':c.end} for c in req.clips])
+        update_job(jid,status='done',url=f'/api/download/{pid}/{jid}',filename=out.name,preview=req.preview,quality_checks=qa)
+    except Exception as exc:
+        out.unlink(missing_ok=True)
+        update_job(jid,status='paused' if isinstance(exc,OSError) else 'error',error=str(exc))
+    finally:
+        for part in parts: part.unlink(missing_ok=True)
+        shutil.rmtree(temporary,ignore_errors=True)
+
+
+@app.post('/api/projects/{pid}/timeline/render')
+def render_timeline(pid: str, req: TimelineRenderRequest):
+    validate_timeline(pid,req.clips); jid=uuid.uuid4().hex
+    with LOCK:
+        if DB.active(pid,'render'): raise HTTPException(409,'A render is already running')
+        DB.create_job(jid,pid,'render',{'status':'queued'})
+    WORKERS.submit(timeline_render_worker,pid,jid,req)
+    return {'job_id':jid}
+
+
+def waveform_worker(pid,jid):
+    try:
+        from waveform import envelope
+        directory=folder(pid);value=metadata(directory)
+        key='waveform-v1:'+value['source_hash']
+        waveform=DB.cache_get(key)
+        if waveform is None:
+            if not any(s['codec_type']=='audio' for s in probe(directory/value['source'])['streams']):
+                raise ValueError('Source has no audio stream')
+            update_job(jid,status='decoding waveform')
+            waveform=envelope(directory/value['source'],value['duration'])
+            DB.cache_put(key,waveform)
+        patch_meta(directory,waveform=waveform)
+        update_job(jid,status='done',waveform=waveform)
+    except Exception as exc:update_job(jid,status='error',error=str(exc))
+
+
+@app.post('/api/projects/{pid}/waveform')
+def build_waveform(pid: str):
+    value=metadata(folder(pid))
+    if not value.get('source'): raise HTTPException(409,'A local source is required')
+    jid=uuid.uuid4().hex
+    with LOCK:
+        active=DB.active(pid,'waveform')
+        if active:return {'job_id':active}
+        DB.create_job(jid,pid,'waveform',{'status':'queued'})
+    WORKERS.submit(waveform_worker,pid,jid)
+    return {'job_id':jid}
+
+
+THUMBNAIL_LOCK=threading.Semaphore(2)
+
+
+@app.get('/api/projects/{pid}/thumbnail')
+def thumbnail(pid: str,time: float=0):
+    directory=folder(pid);value=metadata(directory)
+    if not math.isfinite(time) or not 0<=time<value['duration']:raise HTTPException(400,'Invalid thumbnail time')
+    previews=directory/'previews';previews.mkdir(exist_ok=True)
+    stamp=round(time*100);destination=previews/f'thumb-{stamp}.jpg'
+    with THUMBNAIL_LOCK:
+        if not destination.exists():
+            ensure_space(2*1024*1024)
+            temporary=previews/(uuid.uuid4().hex+'.jpg')
+            try:
+                run([executable('ffmpeg'),'-nostdin','-v','error','-y','-ss',str(stamp/100),'-i',str(directory/value['source']),
+                     '-frames:v','1','-vf','scale=160:-2','-threads','1','-q:v','4',str(temporary)],timeout=30)
+                if not temporary.exists():raise ValueError('No video frame at this time')
+                temporary.replace(destination)
+            except Exception as exc:
+                temporary.unlink(missing_ok=True);raise HTTPException(400,str(exc)) from exc
+    return FileResponse(destination,media_type='image/jpeg')
+
+
+@app.post('/api/projects/{pid}/heuristic')
+def heuristic_discovery(pid: str):
+    directory=folder(pid);value=metadata(directory)
+    if not value.get('transcript'):raise HTTPException(409,'A transcript is required first')
+    return patch_meta(directory,suggestions=rank_candidates(value['transcript'],DB.preferences()),ranking='heuristic',semantic_summary=None)
