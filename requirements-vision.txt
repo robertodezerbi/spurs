@@ -1,0 +1,2 @@
+-r requirements.txt
+# Vision is now included in the core first-run installation.
